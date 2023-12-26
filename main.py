@@ -2,7 +2,8 @@ import csv
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Form, Response, BackgroundTasks
+from fastapi import FastAPI, Request, Form, Response, BackgroundTasks, Body
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -20,6 +21,9 @@ load_dotenv(dotenv_path=env_path)
 app = FastAPI()
 client = WebClient(token=os.environ['SLACK_TOKEN'])
 BOT_ID = client.api_call("auth.test")['user_id']
+
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+model = GPT2LMHeadModel.from_pretrained('gpt2')
 
 message_counts: Dict[str, int] = {}
 
@@ -88,7 +92,8 @@ async def commands():
     commands_list = {
         "/trips": "provides a downloadable csv for all trips",
         "/users": "provides a downloadable csv for all users",
-    }
+        "/message-count": "Shows the count of all messages",    
+        }
 
     # Formatting the response message
     response_message = "\n".join([f"{cmd}: {desc}" for cmd, desc in commands_list.items()])
@@ -101,5 +106,69 @@ async def commands():
 
     return JSONResponse(content=payload)
 
+@app.post('/slack/events')
+async def slack_events(request: Request, body: Dict = Body(...)):
+    # Verify Slack request
+    if request.headers.get('X-Slack-Signature') is None:
+        return Response(status_code=403)
+
+    # Verification challenge
+    if body.get('type') == 'url_verification':
+        return JSONResponse(content={"challenge": body['challenge']})
+
+    # Process event data
+    await process_event_data(body)
+    return Response(content='', status_code=200)
+
+async def process_event_data(data):
+    logger.info(f"Received data: {data}")
+    if data['type'] == 'event_callback':
+        event = data['event']
+        if event['type'] == 'message' and 'bot_id' not in event:
+            if f'<@{BOT_ID}>' in event['text']:
+                response = await generate_ai_response(event['text'])
+                logger.info(f"Generated response: {response}")
+                try:
+                    result = client.chat_postMessage(channel=event['channel'], text=response)
+                    logger.info(f"Message sent to Slack: {result}")
+                except SlackApiError as e:
+                    logger.error(f"Slack API Error: {e.response['error']}")
+
+async def generate_ai_response(input_text):
+    # Remove the bot's mention and strip extra whitespace
+    processed_text = input_text.replace(f'<@{BOT_ID}>', '').strip()
+
+    # Log the processed text for debugging
+    logger.info(f"Processing text: {processed_text}")
+
+    # For simple greetings, return a predefined response
+    if processed_text.lower() in ["hello", "hi", "hey"]:
+        return "Hello! How can I assist you today?"
+
+    # Adjusting model generation settings for more complex inputs
+    try:
+        input_ids = tokenizer.encode(processed_text, return_tensors='pt')
+        output = model.generate(
+            input_ids,
+            max_length=50,
+            temperature=0.8,  # Adjust as needed
+            num_return_sequences=1,
+            do_sample=True,
+            top_k=50  # Limits the possible next words to increase coherence
+        )
+        response = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # Post-process to remove or refine unwanted parts of the response
+        # E.g., remove URLs, trim lengthy responses
+
+        return response
+    except Exception as e:
+        logger.error(f"Error generating response: {e}")
+        return "Sorry, I'm having trouble understanding."
+
+
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", reload=True)
+
